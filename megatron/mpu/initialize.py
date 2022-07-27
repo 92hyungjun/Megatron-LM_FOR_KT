@@ -54,12 +54,6 @@ _POSITION_EMBEDDING_GLOBAL_RANKS = None
 # rank when broadcasting from the first or last pipeline stage.
 _PIPELINE_GLOBAL_RANKS = None
 
-# A list of global ranks for each data parallel group to ease calculation of the source
-# rank when broadcasting weights from src to all other data parallel ranks
-_DATA_PARALLEL_GLOBAL_RANKS = None
-
-
-
 def is_unitialized():
     """Useful for code segments that may be accessed with or without mpu initialization"""
     return _DATA_PARALLEL_GROUP is None
@@ -68,7 +62,8 @@ def is_unitialized():
 def initialize_model_parallel(tensor_model_parallel_size_=1,
                               pipeline_model_parallel_size_=1,
                               virtual_pipeline_model_parallel_size_=None,
-                              pipeline_model_parallel_split_rank_=None):
+                              pipeline_model_parallel_split_rank_=None,
+                              layer_map=None):
     """
     Initialize model data parallel groups.
 
@@ -122,15 +117,25 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_RANK = 0
         _VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE = virtual_pipeline_model_parallel_size_
 
+    global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
     if pipeline_model_parallel_split_rank_ is not None:
-        global _PIPELINE_MODEL_PARALLEL_SPLIT_RANK
         _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = pipeline_model_parallel_split_rank_
-
+    
+    
+    if layer_map is not None:
+        for k, v in layer_map.items():
+            if v['encoder'] != 0 and v['decoder'] != 0:
+                _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = k
+                break
+            elif k != 0 and v['decoder'] != 0:
+                if layer_map[k - 1]['encoder'] != 0:
+                    _PIPELINE_MODEL_PARALLEL_SPLIT_RANK = k
+                    break
+        
     rank = torch.distributed.get_rank()
 
     # Build the data-parallel groups.
     global _DATA_PARALLEL_GROUP
-    global _DATA_PARALLEL_GLOBAL_RANKS
     assert _DATA_PARALLEL_GROUP is None, \
         'data parallel group is already initialized'
     all_data_parallel_group_ranks = []
@@ -144,7 +149,6 @@ def initialize_model_parallel(tensor_model_parallel_size_=1,
             group = torch.distributed.new_group(ranks)
             if rank in ranks:
                 _DATA_PARALLEL_GROUP = group
-                _DATA_PARALLEL_GLOBAL_RANKS = ranks
 
     # Build the model-parallel groups.
     global _MODEL_PARALLEL_GROUP
@@ -325,8 +329,23 @@ def get_pipeline_model_parallel_rank():
         return _MPU_PIPELINE_MODEL_PARALLEL_RANK
     return torch.distributed.get_rank(group=get_pipeline_model_parallel_group())
 
+def get_encoder_num_layers(layer_map):
+    layer_data = layer_map[get_pipeline_model_parallel_rank()]
+    return layer_data['encoder']
 
-def get_num_layers(args, is_encoder_and_decoder_model):
+def get_decoder_num_layers(layer_map):
+    layer_data = layer_map[get_pipeline_model_parallel_rank()]
+    return layer_data['decoder']
+
+def get_offset(layer_map, layer_type='encoder'):
+    rank = get_pipeline_model_parallel_rank()
+    if rank == 0:
+        return 0
+    return sum(
+        map(lambda x: x[layer_type], list(layer_map.values())[:rank])
+        )
+
+def get_num_layers(args, is_encoder_and_decoder_model, is_encoder_count=False, ):
     """Compute the number of transformer layers resident on the current rank."""
     if get_pipeline_model_parallel_world_size() > 1:
         if is_encoder_and_decoder_model:
@@ -373,6 +392,41 @@ def get_num_layers(args, is_encoder_and_decoder_model):
         num_layers = args.num_layers
     return num_layers
 
+def is_encoder_and_decoder_layer(layer_map):
+    return get_encoder_num_layers(layer_map) != 0 and \
+        get_decoder_num_layers(layer_map) != 0
+
+def is_encoder_layer(layer_map):
+    return get_encoder_num_layers(layer_map) != 0
+        
+def is_decoder_layer(layer_map):
+    return get_decoder_num_layers(layer_map) != 0
+
+def is_first_decoder_layer(layer_map):
+    if is_encoder_and_decoder_layer(layer_map):
+        return True
+    elif is_decoder_layer(layer_map) and \
+        not is_pipeline_first_stage():
+            if layer_map[get_pipeline_model_parallel_rank() - 1]['decoder'] == 0:
+                return True
+    return False
+
+def is_last_encoder_layer(layer_map):
+    if is_encoder_and_decoder_layer(layer_map):
+        return True
+    elif is_encoder_layer(layer_map) and \
+        not is_pipeline_last_stage():
+            if layer_map[get_pipeline_model_parallel_rank() + 1]['encoder'] == 0:
+                return True
+    return False
+
+def is_last_decoder_layer(layer_map):
+    if is_pipeline_last_stage() and is_decoder_layer(layer_map):
+        return True
+    return False
+
+def is_last_encoder_layer_or_decoder_layer(layer_map):
+    return is_last_decoder_layer(layer_map) or is_last_encoder_layer(layer_map)
 
 def is_pipeline_first_stage(ignore_virtual=False):
     """Return True if in the first pipeline model-parallel stage, False otherwise."""
@@ -486,10 +540,11 @@ def get_tensor_model_parallel_src_rank():
 
 def get_data_parallel_src_rank():
     """Calculate the global rank corresponding to the first local rank
-    in the data parallel group."""
-    assert _DATA_PARALLEL_GLOBAL_RANKS is not None, \
-        "Data parallel group is not initialized"
-    return _DATA_PARALLEL_GLOBAL_RANKS[0]
+    in the tensor model parallel group."""
+    global_rank = torch.distributed.get_rank()
+    data_parallel_size = get_data_parallel_world_size()
+    num_data_parallel_groups = torch.distributed.get_world_size() // data_parallel_size
+    return global_rank % num_data_parallel_groups
 
 
 def get_pipeline_model_parallel_first_rank():

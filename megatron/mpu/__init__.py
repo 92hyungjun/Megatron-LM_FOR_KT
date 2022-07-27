@@ -15,6 +15,7 @@
 
 """Model parallel utility interface."""
 
+import imp
 from .cross_entropy import vocab_parallel_cross_entropy
 
 from .data import broadcast_data
@@ -48,6 +49,16 @@ from .initialize import get_pipeline_model_parallel_world_size, set_pipeline_mod
 from .initialize import get_virtual_pipeline_model_parallel_rank, set_virtual_pipeline_model_parallel_rank
 from .initialize import initialize_model_parallel
 from .initialize import model_parallel_is_initialized
+from .initialize import get_encoder_num_layers
+from .initialize import get_decoder_num_layers
+from .initialize import is_encoder_and_decoder_layer
+from .initialize import is_encoder_layer
+from .initialize import is_decoder_layer
+from .initialize import get_offset
+from .initialize import is_last_encoder_layer
+from .initialize import is_last_decoder_layer
+from .initialize import is_first_decoder_layer
+from .initialize import is_last_encoder_layer_or_decoder_layer
 
 from .layers import LinearWithGradAccumulationAndAsyncCommunication
 from .layers import ColumnParallelLinear
@@ -76,3 +87,8 @@ from .random import safely_set_viewless_tensor_data
 
 from .utils import divide
 from .utils import split_tensor_along_last_dim
+
+from .ooo_backprop import _initialize_ooo_backprop
+from .ooo_backprop import is_ooo_stage
+from .ooo_backprop import add_ooo_module
+from .ooo_backprop import run_ooo_weight_grad

@@ -14,12 +14,12 @@
 # limitations under the License.
 
 """Transformer."""
-import math
+import math, time
 from contextlib import nullcontext
 import torch
 import torch.nn.functional as F
 
-from megatron import get_timers, get_args, get_global_memory_buffer
+from megatron import get_timers, get_args, get_global_memory_buffer, get_layer_map
 from megatron import mpu
 from .module import MegatronModule
 from megatron.model.enums import AttnMaskType, ModelType, LayerType, AttnType
@@ -680,17 +680,6 @@ class ParallelTransformerLayer(MegatronModule):
                     mlp_bias.expand_as(residual),
                     residual,
                     self.hidden_dropout)
-
-            # Jit compiled function creates 'view' tensor. This tensor
-            # potentially gets saved in the MPU checkpoint function context,
-            # which rejects view tensors. While making a viewless tensor here
-            # won't result in memory savings (like the data loader, or
-            # p2p_communication), it serves to document the origin of this
-            # 'view' tensor.
-            output = mpu.make_viewless_tensor(inp = output,
-                                              requires_grad = output.requires_grad,
-                                              keep_graph = True)
-
         else:
             out = torch.nn.functional.dropout(mlp_output + mlp_bias,
                                               p=self.hidden_dropout,
@@ -734,9 +723,11 @@ class ParallelTransformer(MegatronModule):
                  self_attn_mask_type=AttnMaskType.padding,
                  post_layer_norm=True, 
                  pre_process=True, post_process=True,
-                 drop_path_rate=0.0):
+                 drop_path_rate=0.0,
+                 encoder_decoder_type=False):
         super(ParallelTransformer, self).__init__()
         args = get_args()
+        layer_map = get_layer_map()
 
         self.layer_type = layer_type
         self.model_type = args.model_type
@@ -747,6 +738,7 @@ class ParallelTransformer(MegatronModule):
         self.post_process = post_process
         self.input_tensor = None
         self.drop_path_rate = drop_path_rate
+        self.encoder_decoder_type = encoder_decoder_type
 
         # Store activation checkpoiting flag.
         self.recompute_granularity = args.recompute_granularity
@@ -757,9 +749,16 @@ class ParallelTransformer(MegatronModule):
 
         self.sequence_parallel = args.sequence_parallel
 
-        # Number of layers.
-        self.num_layers = mpu.get_num_layers(
-            args, args.model_type == ModelType.encoder_and_decoder)
+        if args.model_type == ModelType.encoder_and_decoder and \
+            layer_map is not None:
+                if layer_type == LayerType.encoder: 
+                    self.num_layers = mpu.get_encoder_num_layers(layer_map)
+                else:
+                    self.num_layers = mpu.get_decoder_num_layers(layer_map)
+        else:
+            # Number of layers.
+            self.num_layers = mpu.get_num_layers(
+                args, args.model_type == ModelType.encoder_and_decoder)
 
         self.drop_path_rates = [rate.item() for rate in torch.linspace(0, self.drop_path_rate, args.num_layers)]
 
@@ -797,10 +796,17 @@ class ParallelTransformer(MegatronModule):
                     mpu.get_pipeline_model_parallel_world_size() > 1:
                 pipeline_rank = mpu.get_pipeline_model_parallel_rank()
                 if layer_type == LayerType.encoder:
-                    offset = pipeline_rank * self.num_layers
+                    if layer_map is None:
+                        offset = pipeline_rank * self.num_layers
+                    else:
+                        offset = mpu.get_offset(layer_map)
                 else:
-                    num_ranks_in_enc = args.pipeline_model_parallel_split_rank
-                    offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
+                    if layer_map is None:
+                        num_ranks_in_enc = args.pipeline_model_parallel_split_rank
+                        offset = (pipeline_rank - num_ranks_in_enc) * self.num_layers
+                    else:
+                        offset = mpu.get_offset(layer_map, layer_type='decoder')
+                    
             else:
                 offset = mpu.get_pipeline_model_parallel_rank() * self.num_layers
 
@@ -895,7 +901,7 @@ class ParallelTransformer(MegatronModule):
             assert self.recompute_granularity is None, \
                 'inference does not work with activation checkpointing'
 
-        if not self.pre_process:
+        if (not self.pre_process) or (self.encoder_decoder_type):
             # See set_input_tensor()
             hidden_states = self.input_tensor
 

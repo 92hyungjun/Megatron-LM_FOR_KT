@@ -17,10 +17,12 @@
 
 import argparse
 import os
+import json
 
 import torch
 
-def parse_args(extra_args_provider=None, ignore_unknown_args=False):
+def parse_args(extra_args_provider=None, defaults={},
+               ignore_unknown_args=False):
     """Parse all arguments."""
     parser = argparse.ArgumentParser(description='Megatron-LM Arguments',
                                      allow_abbrev=False)
@@ -52,13 +54,9 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     else:
         args = parser.parse_args()
 
-    # Args from environment
+    # Distributed args.
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
-        
-    return args
-
-def validate_args(args, defaults={}):
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -90,7 +88,7 @@ def validate_args(args, defaults={}):
                   args.tensor_model_parallel_size,
                   args.pipeline_model_parallel_size), flush=True)
     if args.pipeline_model_parallel_size > 1:
-        if args.pipeline_model_parallel_split_rank is not None:
+        if args.pipeline_model_parallel_split_rank is not None and args.layer_map is None:
             assert args.pipeline_model_parallel_split_rank < \
                     args.pipeline_model_parallel_size, 'split rank needs'\
                     ' to be less than pipeline model parallel size ({})'.format(
@@ -189,12 +187,6 @@ def validate_args(args, defaults={}):
                       'gradient computation is supported only with fp32 '
                       'gradient accumulation. Setting gradient_accumulation_fusion '
                       'to False', flush=True)
-
-    # If we use the distributed optimizer, we need to have local DDP
-    # and we should make sure use-contiguous-buffers-in-local-ddp is on.
-    if args.use_distributed_optimizer:
-        assert args.DDP_impl == 'local'
-        assert args.use_contiguous_buffers_in_local_ddp
 
     # For torch DDP, we do not use contiguous buffer
     if args.DDP_impl == 'torch':
@@ -365,6 +357,10 @@ def _add_network_size_args(parser):
 
     group.add_argument('--num-layers', type=int, default=None,
                        help='Number of transformer layers.')
+    group.add_argument('--layer-map', type=json.loads, default=None,
+                       help='Map of transformer layers.')
+    group.add_argument('--ooo-map', type=json.loads, default=None,
+                       help='Map of transformer layers.')
     group.add_argument('--hidden-size', type=int, default=None,
                        help='Tansformer hidden size.')
     group.add_argument('--ffn-hidden-size', type=int, default=None,
@@ -682,14 +678,6 @@ def _add_checkpointing_args(parser):
                        help='Load model for finetuning. Do not load optimizer '
                        'or rng state from checkpoint and set iteration to 0. '
                        'Assumed when loading a release checkpoint.')
-    group.add_argument('--no-initialization', action='store_false',
-                       help='Do not perform initialization when building model, '
-                       'can reduce startup time when definitely loading from a '
-                       'checkpoint',
-                       dest='perform_initialization')
-    group.add_argument('--use-checkpoint-args', action='store_true',
-                       help='Override any command line arguments with arguments '
-                       'from the checkpoint')
 
     return parser
 
@@ -782,9 +770,6 @@ def _add_distributed_args(parser):
                        'is placed on its own pipeline stage, without any '
                        'transformer layers. (For T5, this flag currently only '
                        'affects the encoder embedding.)')
-    group.add_argument('--use-distributed-optimizer', action='store_true',
-                       help='Use distributed optimizer.')
-
     return parser
 
 

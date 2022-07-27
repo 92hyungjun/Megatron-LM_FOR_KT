@@ -24,6 +24,7 @@ import torch
 
 from megatron import dist_signal_handler
 from megatron.tokenizer import build_tokenizer
+from .arguments import parse_args
 from .microbatches import build_num_microbatches_calculator
 
 _GLOBAL_ARGS = None
@@ -34,6 +35,8 @@ _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
 _GLOBAL_MEMORY_BUFFER = None
+_GLOBAL_LAYER_MAP = None
+_GLOBAL_OOO_MAP = None
 
 def get_args():
     """Return arguments."""
@@ -87,6 +90,13 @@ def get_global_memory_buffer():
     _ensure_var_is_initialized(_GLOBAL_MEMORY_BUFFER, 'global memory buffer')
     return _GLOBAL_MEMORY_BUFFER
 
+def get_layer_map():
+    _ensure_var_is_initialized(_GLOBAL_LAYER_MAP, 'layer map')
+    return _GLOBAL_LAYER_MAP
+
+def get_ooo_map():
+    _ensure_var_is_initialized(_GLOBAL_OOO_MAP, 'ooo map')
+    return _GLOBAL_OOO_MAP
 
 def _set_signal_handler():
     global _GLOBAL_SIGNAL_HANDLER
@@ -94,30 +104,35 @@ def _set_signal_handler():
     _GLOBAL_SIGNAL_HANDLER = dist_signal_handler.DistributedSignalHandler().__enter__()
 
 
-
-def set_global_variables(args):
+def set_global_variables(extra_args_provider=None, args_defaults={},
+                         ignore_unknown_args=False):
     """Set args, tokenizer, tensorboard-writer, adlr-autoresume, and timers."""
-
-    assert args is not None
-
-    _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-    set_args(args)
-
+    args = _parse_args(extra_args_provider=extra_args_provider,
+                       defaults=args_defaults,
+                       ignore_unknown_args=ignore_unknown_args)
     _build_num_microbatches_calculator(args)
     if args.vocab_file:
         _ = _build_tokenizer(args)
     _set_tensorboard_writer(args)
     _set_adlr_autoresume(args)
+    _set_layer_map(args)
+    _set_ooo_map(args)
     _set_timers()
     _set_global_memory_buffer()
 
     if args.exit_signal_handler:
         _set_signal_handler()
-    
 
-def set_args(args):
+
+def _parse_args(extra_args_provider=None, defaults={},
+                ignore_unknown_args=False):
+    """Parse entire arguments."""
     global _GLOBAL_ARGS
-    _GLOBAL_ARGS = args
+    _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
+    _GLOBAL_ARGS = parse_args(extra_args_provider=extra_args_provider,
+                              defaults=defaults,
+                              ignore_unknown_args=ignore_unknown_args)
+    return _GLOBAL_ARGS
 
 
 def _build_num_microbatches_calculator(args):
@@ -180,7 +195,20 @@ def _set_adlr_autoresume(args):
             sys.exit()
 
         _GLOBAL_ADLR_AUTORESUME = AutoResume
-
+     
+def _set_layer_map(args):
+    """Initialize layer map."""
+    global _GLOBAL_LAYER_MAP
+    _ensure_var_is_not_initialized(_GLOBAL_LAYER_MAP, 'layer map')
+    if args.layer_map is not None:
+        _GLOBAL_LAYER_MAP = {int(k):(int(v) if isinstance(v, str) else v) for k,v in args.layer_map.items()}
+        
+def _set_ooo_map(args):
+    """Initialize ooo map."""
+    global _GLOBAL_OOO_MAP
+    _ensure_var_is_not_initialized(_GLOBAL_OOO_MAP, 'ooo map')
+    if args.ooo_map is not None:
+        _GLOBAL_OOO_MAP = {int(k):(bool(int(v)) if isinstance(v, str) else v) for k,v in args.ooo_map.items()}
 
 def _set_timers():
     """Initialize timers."""

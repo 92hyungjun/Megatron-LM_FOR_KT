@@ -19,10 +19,13 @@ import torch
 
 from megatron import (
     get_args,
+    get_layer_map,
     mpu
 )
+from megatron.mpu.layers import NoWeightGradLinear
 from megatron.model.enums import AttnMaskType
 from megatron.model.language_model import parallel_lm_logits, get_language_model
+from megatron.model.language_model import parallel_lm_logits_custom
 from megatron.model.transformer import LayerNorm
 from megatron.model.utils import (
     openai_gelu,
@@ -64,7 +67,7 @@ class T5LMHead(MegatronModule):
         parallel_output: wether output logits being distributed or not.
     """
 
-    def __init__(self, mpu_vocab_size, parallel_output):
+    def __init__(self, mpu_vocab_size, parallel_output, embedding_weights=None):
         super(T5LMHead, self).__init__()
 
         args = get_args()
@@ -75,8 +78,16 @@ class T5LMHead(MegatronModule):
         self.bias.stride = 1
         self.parallel_output = parallel_output
 
+        #XXX
+        if mpu.is_ooo_stage():
+            self.embedding_matmul = NoWeightGradLinear(embedding_weights, self.bias)
+            mpu.add_ooo_module("embedding_matmul_module", self.embedding_matmul)
+
     def forward(self, hidden_states, word_embeddings_weight):
-        output = parallel_lm_logits(hidden_states,
+        if mpu.is_ooo_stage():
+            output = parallel_lm_logits_custom(hidden_states, self.parallel_output, self.embedding_matmul)
+        else:
+            output = parallel_lm_logits(hidden_states,
                                     word_embeddings_weight,
                                     self.parallel_output,
                                     bias=self.bias)
@@ -95,7 +106,9 @@ class T5Model(MegatronModule):
                  add_decoder=True):
         super(T5Model, self).__init__()
         args = get_args()
+        layer_map = get_layer_map()
 
+        self.is_last_decoder_layer = mpu.is_last_decoder_layer(layer_map)
         self.fp16_lm_cross_entropy = args.fp16_lm_cross_entropy
         self.parallel_output = parallel_output
         init_method = init_method_normal(args.init_method_std)
@@ -119,10 +132,11 @@ class T5Model(MegatronModule):
 
         self.initialize_word_embeddings(init_method_normal)
 
-        if self.post_process and self.add_decoder:
+        #if self.post_process and self.add_decoder:
+        if self.is_last_decoder_layer:
             self.lm_head = T5LMHead(
                 self.word_embeddings_weight().size(0),
-                parallel_output)
+                parallel_output, self.word_embeddings_weight())
             self._lm_head_key = 'lm_head'
 
     def set_input_tensor(self, input_tensor):
@@ -150,7 +164,7 @@ class T5Model(MegatronModule):
                                         tokentype_ids=tokentype_ids,
                                         enc_hidden_states=enc_hidden_states)
 
-        if self.post_process and self.add_decoder:
+        if self.post_process and self.is_last_decoder_layer:
             decoder_output, encoder_output = lm_output
             # Output. [s, b, h]
             lm_logits = self.lm_head(decoder_output,
@@ -171,6 +185,9 @@ class T5Model(MegatronModule):
                 # [s b] => [b s]
                 lm_loss = lm_loss.transpose(0,1).contiguous()
             return lm_loss
+        elif self.add_encoder and self.add_decoder:
+            decoder_output, encoder_output = lm_output
+            return [decoder_output, encoder_output]
         elif self.add_decoder and not self.add_encoder:
             decoder_output, encoder_output = lm_output
             return decoder_output

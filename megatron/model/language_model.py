@@ -54,6 +54,24 @@ def parallel_lm_logits(input_, word_embeddings_weight, parallel_output,
 
     return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
 
+def parallel_lm_logits_custom(input_, parallel_output, matmul_fn):
+    """LM logits using word embedding weights."""
+    args = get_args()
+    # Parallel logits.
+    if args.async_tensor_model_parallel_allreduce or\
+            args.sequence_parallel:
+        input_parallel = input_
+    else:
+        input_parallel = mpu.copy_to_tensor_model_parallel_region(input_)
+
+    # Matrix multiply.
+    logits_parallel = matmul_fn(input_parallel)
+
+    # Gather if needed.
+    if parallel_output:
+        return logits_parallel
+
+    return mpu.gather_from_tensor_model_parallel_region(logits_parallel)
 
 def get_language_model(num_tokentypes, add_pooler,
                        encoder_attn_mask_type, init_method=None,
@@ -166,8 +184,7 @@ class Embedding(MegatronModule):
             max_sequence_length, self.hidden_size)
         self._position_embeddings_key = 'position_embeddings'
         # Initialize the position embeddings.
-        if args.perform_initialization:
-            self.init_method(self.position_embeddings.weight)
+        self.init_method(self.position_embeddings.weight)
 
         # Token type embedding.
         # Add this as an optional field that can be added through
@@ -178,8 +195,7 @@ class Embedding(MegatronModule):
             self.tokentype_embeddings = torch.nn.Embedding(self.num_tokentypes,
                                                            self.hidden_size)
             # Initialize the token-type embeddings.
-            if args.perform_initialization:
-                self.init_method(self.tokentype_embeddings.weight)
+            self.init_method(self.tokentype_embeddings.weight)
         else:
             self.tokentype_embeddings = None
 
@@ -344,6 +360,9 @@ class TransformerLanguageModel(MegatronModule):
         self.decoder_attn_mask_type = decoder_attn_mask_type
         self.add_pooler = add_pooler
         self.encoder_hidden_state = None
+        self.is_first_stage = mpu.is_pipeline_first_stage()
+            
+        self.encoder_decoder_type = (add_encoder and self.add_decoder) if not self.is_first_stage else False
 
         # Embeddings.
         if self.pre_process:
@@ -364,7 +383,8 @@ class TransformerLanguageModel(MegatronModule):
                 output_layer_init_method,
                 self_attn_mask_type=self.encoder_attn_mask_type,
                 pre_process=self.pre_process,
-                post_process=self.post_process
+                post_process=self.post_process,
+                encoder_decoder_type = self.encoder_decoder_type
             )
             self._encoder_key = 'encoder'
         else:
@@ -426,7 +446,7 @@ class TransformerLanguageModel(MegatronModule):
                 enc_hidden_states=None, output_enc_hidden=False):
 
         # Encoder embedding.
-        if self.pre_process:
+        if self.pre_process and ((not self.add_decoder) or self.is_first_stage):
             encoder_input = self.embedding(enc_input_ids, enc_position_ids,
                                            tokentype_ids=tokentype_ids)
         else:

@@ -23,6 +23,7 @@ import time
 _TRAIN_START_TIME = time.time()
 import torch
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
 from megatron import get_args
 from megatron import get_signal_handler
@@ -30,6 +31,7 @@ from megatron import get_timers
 from megatron import get_tensorboard_writer
 from megatron import get_current_global_batch_size
 from megatron import get_num_microbatches
+from megatron import get_layer_map
 from megatron import is_last_rank
 from megatron import update_num_microbatches
 from megatron import mpu
@@ -233,16 +235,23 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         add_decoder = True
         if model_type == ModelType.encoder_and_decoder:
             if mpu.get_pipeline_model_parallel_world_size() > 1:
-                assert args.pipeline_model_parallel_split_rank is not None, \
-                    "Split rank needs to be specified for model with both encoder and decoder"
+                assert args.pipeline_model_parallel_split_rank is not None or args.layer_map is not None, \
+                    "Split rank or layer map needs to be specified for model with both encoder and decoder"
                 rank = mpu.get_pipeline_model_parallel_rank()
-                split_rank = args.pipeline_model_parallel_split_rank
-                world_size = mpu.get_pipeline_model_parallel_world_size()
-                pre_process = rank == 0 or rank == split_rank
-                post_process = (rank == (split_rank - 1)) or (
-                        rank == (world_size - 1))
-                add_encoder = mpu.is_pipeline_stage_before_split()
-                add_decoder = mpu.is_pipeline_stage_after_split()
+                layer_map = get_layer_map()
+                if layer_map is not None:
+                    pre_process = rank == 0 or mpu.is_first_decoder_layer(layer_map)
+                    post_process = mpu.is_last_encoder_layer_or_decoder_layer(layer_map)
+                    add_encoder = mpu.is_encoder_layer(layer_map)
+                    add_decoder = mpu.is_decoder_layer(layer_map)
+                else:
+                    split_rank = args.pipeline_model_parallel_split_rank
+                    world_size = mpu.get_pipeline_model_parallel_world_size()
+                    pre_process = rank == 0 or rank == split_rank
+                    post_process = (rank == (split_rank - 1)) or (
+                            rank == (world_size - 1))
+                    add_encoder = mpu.is_pipeline_stage_before_split()
+                    add_decoder = mpu.is_pipeline_stage_after_split()
             model = model_provider_func(
                 pre_process=pre_process,
                 post_process=post_process,
@@ -364,11 +373,12 @@ def setup_model_and_optimizer(model_provider_func,
     args = get_args()
 
     model = get_model(model_provider_func, model_type)
+
     unwrapped_model = unwrap_model(model,
                                    (torchDDP, LocalDDP, Float16Module))
-
-    optimizer = get_megatron_optimizer(model, no_wd_decay_cond,
+    optimizer = get_megatron_optimizer(unwrapped_model, no_wd_decay_cond,
                                        scale_lr_cond, lr_mult)
+
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None:
@@ -411,43 +421,96 @@ def train_step(forward_step_func, data_iterator,
             partition.zero_grad_buffer()
     optimizer.zero_grad()
 
-    # Forward pass.
     forward_backward_func = get_forward_backward_func()
     losses_reduced = forward_backward_func(
         forward_step_func, data_iterator, model,
         optimizer, timers, forward_only=False)
 
-    # Empty unused memory.
+    # Empty unused memory
     if args.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
-    # Reduce gradients.
-    timers('backward-reduce-model-grads').start()
-    optimizer.reduce_model_grads(args, timers)
-    timers('backward-reduce-model-grads').stop()
+    # All-reduce layernorm parameters across model parallel nodes
+    # when sequence parallelism is used
+    if mpu.get_tensor_model_parallel_world_size() > 1 and \
+            args.sequence_parallel:
+        grads = []
+        for model_module in model:
+            unwrapped_model = unwrap_model( 
+                model_module, (torchDDP, LocalDDP, Float16Module))
+            for param in unwrapped_model.parameters():
+                if getattr(param, 'sequence_parallel', False):
+                    grad = param.main_grad if args.DDP_impl == 'local' else param.grad
+                    grads.append(grad.data)
+        coalesced = _flatten_dense_tensors(grads)
+        torch.distributed.all_reduce(
+            coalesced, group=mpu.get_tensor_model_parallel_group())
+        for buf, synced in zip(grads, _unflatten_dense_tensors(
+                coalesced, grads)):
+            buf.copy_(synced)
 
-    # Vision gradients.
+    # All-reduce if needed.
+    if args.DDP_impl == 'local':
+        timers('backward-params-all-reduce').start()
+        for model_module in model:
+            model_module.allreduce_gradients()
+        timers('backward-params-all-reduce').stop()
+
+    # All-reduce word_embeddings' grad across first and last stages to ensure
+    # that word_embeddings parameters stay in sync.
+    # This should only run for models that support pipelined model parallelism
+    # (BERT and GPT-2).
+    timers('backward-embedding-all-reduce').start()
+    if mpu.is_rank_in_embedding_group(ignore_virtual=True) and \
+            mpu.get_pipeline_model_parallel_world_size() > 1:
+        if mpu.is_pipeline_first_stage(ignore_virtual=True):
+            unwrapped_model = model[0]
+        elif mpu.is_pipeline_last_stage(ignore_virtual=True):
+            unwrapped_model = model[-1]
+        else:  # We do not support the interleaved schedule for T5 yet.
+            unwrapped_model = model[0]
+        unwrapped_model = unwrap_model(
+            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+
+        if unwrapped_model.share_word_embeddings:
+            word_embeddings_weight = unwrapped_model.word_embeddings_weight()
+            if args.DDP_impl == 'local':
+                grad = word_embeddings_weight.main_grad
+            else:
+                grad = word_embeddings_weight.grad
+            torch.distributed.all_reduce(grad, group=mpu.get_embedding_group())
+
+    # All-reduce position_embeddings grad across first (encoder) and split (decoder) 
+    # stages to ensure that position embeddings parameters stay in sync.
+    # This should only run for T5 models with pipeline parallelism
+    if mpu.is_rank_in_position_embedding_group() and \
+            mpu.get_pipeline_model_parallel_world_size() > 1 and \
+            args.pipeline_model_parallel_split_rank is not None:
+        unwrapped_model = model[0]
+        unwrapped_model = unwrap_model(
+            unwrapped_model, (torchDDP, LocalDDP, Float16Module))
+        assert args.DDP_impl == 'local', \
+            'T5 model is only supported with local DDP mode'
+        grad = unwrapped_model.language_model.embedding.position_embeddings.weight.main_grad
+        torch.distributed.all_reduce(grad, group=mpu.get_position_embedding_group())
+    timers('backward-embedding-all-reduce').stop()
+
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+
     # Update parameters.
     timers('optimizer').start()
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
 
-    # Gather params.
-    if update_successful:
-        timers('backward-gather-model-params').start()
-        optimizer.gather_model_params(args, timers)
-        timers('backward-gather-model-params').stop()
-
-    # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0],
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.update_momentum(args.curr_iteration)
+
 
     # Update learning rate.
     if update_successful:
@@ -459,7 +522,7 @@ def train_step(forward_step_func, data_iterator,
     else:
         skipped_iter = 1
 
-    # Empty unused memory.
+    # Empty unused memory
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
@@ -526,15 +589,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
     add_to_logging('backward-send-forward-recv')
     add_to_logging('backward-send-backward-recv')
     add_to_logging('backward-params-all-reduce')
-    add_to_logging('backward-layernorm-all-reduce')
     add_to_logging('backward-embedding-all-reduce')
-    add_to_logging('backward-reduce-model-grads')
-    add_to_logging('backward-gather-model-params')
     add_to_logging('optimizer-copy-to-main-grad')
     add_to_logging('optimizer-unscale-and-check-inf')
     add_to_logging('optimizer-clip-main-grad')
-    add_to_logging('optimizer-count-zeros')
-    add_to_logging('optimizer-inner-step')
     add_to_logging('optimizer-copy-main-to-model-params')
     add_to_logging('optimizer')
     add_to_logging('batch-generator')
@@ -687,12 +745,17 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     while iteration < args.train_iters:
         update_num_microbatches(args.consumed_train_samples)
         args.curr_iteration = iteration
+        start_time = time.time()
         loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
             train_step(forward_step_func,
                        train_data_iterator,
                        model,
                        optimizer,
                        opt_param_scheduler)
+
+        end_time = time.time()
+        print(end_time - start_time)
+        time.sleep(0.3)
         iteration += 1
         args.consumed_train_samples += mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \

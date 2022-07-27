@@ -35,11 +35,14 @@ from .mappings import reduce_from_tensor_model_parallel_region
 from .mappings import scatter_to_tensor_model_parallel_region
 from .mappings import reduce_scatter_to_sequence_parallel_region
 
+from .ooo_backprop import is_ooo_stage, add_ooo_module
+
 from .random import get_cuda_rng_tracker
 from .utils import divide
 from .utils import split_tensor_along_last_dim
 from .utils import VocabUtility
 from megatron import get_args, get_global_memory_buffer
+
 
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {'tensor_model_parallel': False,
                                       'partition_dim': -1,
@@ -167,17 +170,15 @@ class VocabParallelEmbedding(torch.nn.Module):
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 dtype=args.params_dtype))
-            if args.perform_initialization:
-                _initialize_affine_weight_cpu(
-                    self.weight, self.num_embeddings, self.embedding_dim,
-                    self.num_embeddings_per_partition, 0, init_method)
+            _initialize_affine_weight_cpu(
+                self.weight, self.num_embeddings, self.embedding_dim,
+                self.num_embeddings_per_partition, 0, init_method)
         else:
             self.weight = Parameter(torch.empty(
                 self.num_embeddings_per_partition, self.embedding_dim,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
-            if args.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=0, stride=1)
+            _initialize_affine_weight_gpu(self.weight, init_method,
+                                          partition_dim=0, stride=1)
 
     def forward(self, input_):
         if self.tensor_model_parallel_size > 1:
@@ -312,6 +313,41 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None, None, None
 
 
+class NoWeightGradLinear(torch.nn.Module):
+  __slots__ = ['weight']
+  def __init__(self, weight, bias):
+    super(NoWeightGradLinear, self).__init__()
+    self.weight = weight
+    self.bias = bias
+
+  def forward(self, x):
+    result = NoWeightGradMatMul.apply(x, self.weight, self.bias)
+    return result
+
+class NoWeightGradMatMul(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, data, weight, bias):
+        ctx.save_for_backward(data, weight)
+        ctx.use_bias = bias is not None
+
+        result = torch.matmul(data, weight.t())
+        if bias is not None:
+            result = result + bias
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        #_, var = ctx.saved_tensors
+        input, weight = ctx.saved_tensors
+        use_bias = ctx.use_bias
+
+
+        grad_input = grad_output.matmul(weight)
+        grad_bias = grad_output.sum(dim=0) if use_bias else None
+
+        return grad_input, None, grad_bias
+
+
 class ColumnParallelLinear(torch.nn.Module):
     """Linear layer with column parallelism.
 
@@ -332,7 +368,7 @@ class ColumnParallelLinear(torch.nn.Module):
                                      set to False. It returns the master weights
                                      used for initialization.
         skip_bias_add: This was added to enable performance optimations where bias
-                       can be fused with other elementwise operations. we skip
+                       can be fused with other elementwise operations. we skip 
                        adding bias but instead return it.
     """
 
@@ -360,18 +396,16 @@ class ColumnParallelLinear(torch.nn.Module):
             self.weight = Parameter(torch.empty(self.output_size_per_partition,
                                                 self.input_size,
                                                 dtype=args.params_dtype))
-            if args.perform_initialization:
-                self.master_weight = _initialize_affine_weight_cpu(
-                    self.weight, self.output_size, self.input_size,
-                    self.output_size_per_partition, 0, init_method,
-                    stride=stride, return_master_weight=keep_master_weight_for_test)
+            self.master_weight = _initialize_affine_weight_cpu(
+                self.weight, self.output_size, self.input_size,
+                self.output_size_per_partition, 0, init_method,
+                stride=stride, return_master_weight=keep_master_weight_for_test)
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size_per_partition, self.input_size,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
-            if args.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=0, stride=stride)
+            _initialize_affine_weight_gpu(self.weight, init_method,
+                                          partition_dim=0, stride=stride)
 
         if bias:
             if args.use_cpu_initialization:
@@ -398,6 +432,14 @@ class ColumnParallelLinear(torch.nn.Module):
             not self.sequence_parallel
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
 
+
+        #XXX
+        self.custom_matmul_without_wgrad = None
+        bias = self.bias if not self.skip_bias_add else None
+        if is_ooo_stage():
+            self.custom_matmul_without_wgrad = NoWeightGradLinear(self.weight, bias)
+            add_ooo_module("col_p", self.custom_matmul_without_wgrad)
+
     def forward(self, input_):
         bias = self.bias if not self.skip_bias_add else None
 
@@ -407,9 +449,12 @@ class ColumnParallelLinear(torch.nn.Module):
         else:
             input_parallel = copy_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
-            input_parallel, self.weight, bias, self.gradient_accumulation_fusion,
-            self.async_tensor_model_parallel_allreduce, self.sequence_parallel)
+        if self.custom_matmul_without_wgrad is not None:
+            output_parallel = self.custom_matmul_without_wgrad(input_parallel)
+        else:
+            output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
+                input_parallel, self.weight, bias, self.gradient_accumulation_fusion,
+                self.async_tensor_model_parallel_allreduce, self.sequence_parallel)
         if self.gather_output:
             # All-gather across the partitions.
             assert not self.sequence_parallel
@@ -475,18 +520,16 @@ class RowParallelLinear(torch.nn.Module):
             self.weight = Parameter(torch.empty(self.output_size,
                                                 self.input_size_per_partition,
                                                 dtype=args.params_dtype))
-            if args.perform_initialization:
-                self.master_weight = _initialize_affine_weight_cpu(
-                    self.weight, self.output_size, self.input_size,
-                    self.input_size_per_partition, 1, init_method,
-                    stride=stride, return_master_weight=keep_master_weight_for_test)
+            self.master_weight = _initialize_affine_weight_cpu(
+                self.weight, self.output_size, self.input_size,
+                self.input_size_per_partition, 1, init_method,
+                stride=stride, return_master_weight=keep_master_weight_for_test)
         else:
             self.weight = Parameter(torch.empty(
                 self.output_size, self.input_size_per_partition,
                 device=torch.cuda.current_device(), dtype=args.params_dtype))
-            if args.perform_initialization:
-                _initialize_affine_weight_gpu(self.weight, init_method,
-                                              partition_dim=1, stride=stride)
+            _initialize_affine_weight_gpu(self.weight, init_method,
+                                          partition_dim=1, stride=stride)
         if bias:
             if args.use_cpu_initialization:
                 self.bias = Parameter(torch.empty(self.output_size,
@@ -505,7 +548,11 @@ class RowParallelLinear(torch.nn.Module):
         self.sequence_parallel = args.sequence_parallel
         self.gradient_accumulation_fusion = args.gradient_accumulation_fusion
 
-
+        #XXX
+        self.custom_matmul_without_wgrad = None
+        if is_ooo_stage():
+            self.custom_matmul_without_wgrad = NoWeightGradLinear(self.weight, None)
+            add_ooo_module("row_p", self.custom_matmul_without_wgrad)
 
     def forward(self, input_):
         # Set up backprop all-reduce.
@@ -515,9 +562,12 @@ class RowParallelLinear(torch.nn.Module):
             assert not self.sequence_parallel
             input_parallel = scatter_to_tensor_model_parallel_region(input_)
         # Matrix multiply.
-        output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
-            input_parallel, self.weight, None,
-            self.gradient_accumulation_fusion, None, None)
+        if self.custom_matmul_without_wgrad is not None:
+            output_parallel = self.custom_matmul_without_wgrad(input_parallel)
+        else:
+            output_parallel = LinearWithGradAccumulationAndAsyncCommunication.apply(
+                input_parallel, self.weight, None,
+                self.gradient_accumulation_fusion, None, None)
         # All-reduce across all the partitions.
         if self.sequence_parallel:
             output_ = reduce_scatter_to_sequence_parallel_region(output_parallel)
@@ -530,3 +580,4 @@ class RowParallelLinear(torch.nn.Module):
             output = output_
             output_bias = self.bias
         return output, output_bias
+
